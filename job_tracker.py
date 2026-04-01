@@ -14,8 +14,13 @@ import subprocess
 import json
 import re
 import time
+import os
 from datetime import datetime
 from collections import defaultdict
+
+CONFIG_PATH = os.path.expanduser("~/.config/gws/job_tracker_config.json")
+FOLDER_NAME = "Job Application Tracker"
+SHEET_NAME  = "Job Applications Tracker"
 
 # ─────────────────────────────────────────────────────────────
 # KEYWORDS — These are phrases we look for in email bodies
@@ -453,6 +458,135 @@ def get_email_details(msg_id, include_snippet=True):
         "position": position,
         "snippet": snippet,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG — persist folder + sheet IDs between runs
+# ─────────────────────────────────────────────────────────────
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_config(data):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ─────────────────────────────────────────────────────────────
+# DRIVE — find or create the tracker folder
+# ─────────────────────────────────────────────────────────────
+def find_or_create_folder(name):
+    """Return the Drive folder ID for `name`, creating it if needed."""
+    query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    result = run_gws(["drive", "files", "list", "--params", json.dumps({"q": query, "fields": "files(id,name)"})])
+    files = (result or {}).get("files", [])
+    if files:
+        return files[0]["id"]
+
+    # Create the folder
+    created = run_gws([
+        "drive", "files", "create",
+        "--json", json.dumps({
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder"
+        }),
+        "--params", json.dumps({"fields": "id"})
+    ])
+    return (created or {}).get("id")
+
+
+def move_to_folder(file_id, folder_id):
+    """Move a Drive file into the given folder."""
+    # Get current parents first
+    info = run_gws(["drive", "files", "get", "--params", json.dumps({"fileId": file_id, "fields": "parents"})])
+    current_parents = ",".join((info or {}).get("parents", []))
+    run_gws([
+        "drive", "files", "update",
+        "--params", json.dumps({
+            "fileId": file_id,
+            "addParents": folder_id,
+            "removeParents": current_parents,
+            "fields": "id"
+        })
+    ])
+
+
+def verify_sheet_exists(spreadsheet_id):
+    """Return True if the spreadsheet still exists and is accessible."""
+    result = run_gws([
+        "sheets", "spreadsheets", "get",
+        "--params", json.dumps({"spreadsheetId": spreadsheet_id, "fields": "spreadsheetId"})
+    ])
+    return result is not None
+
+
+def clear_sheet_for_reuse(spreadsheet_id):
+    """
+    Delete all embedded charts and clear all data ranges so the sheet
+    can be fully rewritten on this run.
+    """
+    # Get current spreadsheet state (charts live inside each sheet)
+    info = run_gws([
+        "sheets", "spreadsheets", "get",
+        "--params", json.dumps({"spreadsheetId": spreadsheet_id,
+                                "fields": "sheets(properties(sheetId),charts(chartId))"})
+    ])
+    if not info:
+        return
+
+    delete_requests = []
+    clear_ranges = []
+
+    for sheet in info.get("sheets", []):
+        sid = sheet["properties"]["sheetId"]
+        # Queue chart deletions
+        for chart in sheet.get("charts", []):
+            delete_requests.append({
+                "deleteEmbeddedObject": {"objectId": chart["chartId"]}
+            })
+        # Queue data clears
+        sheet_title_map = {10: "Dashboard", 20: "Applications", 30: "Monthly Summary", 40: "Chart Data"}
+        title = sheet_title_map.get(sid)
+        if title:
+            clear_ranges.append(f"{title}!A1:ZZ10000")
+
+    # Delete charts
+    if delete_requests:
+        run_gws([
+            "sheets", "spreadsheets", "batchUpdate",
+            "--params", json.dumps({"spreadsheetId": spreadsheet_id}),
+            "--json", json.dumps({"requests": delete_requests})
+        ])
+
+    # Clear data
+    for r in clear_ranges:
+        run_gws([
+            "sheets", "spreadsheets", "values", "clear",
+            "--params", json.dumps({"spreadsheetId": spreadsheet_id, "range": r})
+        ])
+
+    # Also clear any existing banding so it doesn't stack up
+    info2 = run_gws([
+        "sheets", "spreadsheets", "get",
+        "--params", json.dumps({"spreadsheetId": spreadsheet_id,
+                                "fields": "sheets(bandedRanges(bandedRangeId))"})
+    ])
+    banding_requests = []
+    for sheet in (info2 or {}).get("sheets", []):
+        for band in sheet.get("bandedRanges", []):
+            banding_requests.append({"deleteBanding": {"bandedRangeId": band["bandedRangeId"]}})
+    if banding_requests:
+        run_gws([
+            "sheets", "spreadsheets", "batchUpdate",
+            "--params", json.dumps({"spreadsheetId": spreadsheet_id}),
+            "--json", json.dumps({"requests": banding_requests})
+        ])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1012,18 +1146,45 @@ def main():
     if "Unknown" in month_counts:
         sorted_months.append("Unknown")
 
-    # ── STEP 4: Create Google Sheet with four tabs ────────────
-    print("[ STEP 4 ] Creating your Google Sheet...")
-    today_str = datetime.now().strftime("%b %d, %Y")
-    sheet_id, dash_sheet_id, app_sheet_id, summary_sheet_id, chart_data_sheet_id = create_sheet_with_tabs(
-        f"Job Applications Tracker ({today_str})"
-    )
+    # ── STEP 4: Find or create the Drive folder + sheet ───────
+    print("[ STEP 4 ] Setting up Google Drive folder and Sheet...")
+    config = load_config()
 
-    if not sheet_id:
-        print("\nCould not create the Google Sheet. Run `gws auth login` and try again.")
-        return
+    # Ensure the folder exists
+    folder_id = config.get("folder_id")
+    if not folder_id:
+        print("   Creating Drive folder...")
+        folder_id = find_or_create_folder(FOLDER_NAME)
+        if not folder_id:
+            print("\nCould not create Drive folder. Run `gws auth login` and try again.")
+            return
+        config["folder_id"] = folder_id
+        save_config(config)
+        print(f"   Folder created: {FOLDER_NAME}")
+    else:
+        print(f"   Using existing folder: {FOLDER_NAME}")
 
-    print("   Sheet created! Writing your data...\n")
+    # Check if tracker sheet already exists
+    sheet_id = config.get("spreadsheet_id")
+    reusing = False
+
+    if sheet_id and verify_sheet_exists(sheet_id):
+        print("   Found existing sheet — clearing for fresh data...")
+        clear_sheet_for_reuse(sheet_id)
+        dash_sheet_id, app_sheet_id, summary_sheet_id, chart_data_sheet_id = 10, 20, 30, 40
+        reusing = True
+    else:
+        print("   Creating new sheet...")
+        sheet_id, dash_sheet_id, app_sheet_id, summary_sheet_id, chart_data_sheet_id = \
+            create_sheet_with_tabs(SHEET_NAME)
+        if not sheet_id:
+            print("\nCould not create the Google Sheet. Run `gws auth login` and try again.")
+            return
+        move_to_folder(sheet_id, folder_id)
+        config["spreadsheet_id"] = sheet_id
+        save_config(config)
+
+    print(f"   {'Updated' if reusing else 'Created'} sheet. Writing your data...\n")
 
     # ── Write: Applications tab (master list) ─────────────────
     app_headers = [["Date", "Company", "Position", "Subject", "Sender"]]
@@ -1070,7 +1231,8 @@ def main():
         print(f"    {month:<20} {month_counts[month]:>3} applications   "
               f"{len(month_companies[month]):>3} unique companies")
     print()
-    print("  Your Google Sheet is ready (2 tabs: Applications + Monthly Summary + Charts):")
+    print(f"  Saved in Drive folder    : {FOLDER_NAME}")
+    print("  Your Google Sheet:")
     print(f"  https://docs.google.com/spreadsheets/d/{sheet_id}")
     print()
 
