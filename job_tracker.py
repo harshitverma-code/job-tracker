@@ -44,11 +44,13 @@ KEYWORDS = [
 # We handle these specially to extract the real company name.
 # ─────────────────────────────────────────────────────────────
 ATS_DOMAINS = {
-    "greenhouse.io", "lever.co", "workday.com", "icims.com", "taleo.net",
+    "greenhouse.io", "greenhouse-mail.io", "lever.co", "workday.com", "icims.com", "taleo.net",
     "jobvite.com", "smartrecruiters.com", "ashbyhq.com", "breezy.hr",
     "bamboohr.com", "successfactors.com", "myworkdayjobs.com",
     "workdayjobs.com", "recruiting.com", "hire.trakstar.com",
     "jazz.co", "resumatormail.com", "applytojob.com",
+    "rippling.com", "workable.com", "personio.com", "recruitee.com",
+    "pinpointhq.com", "dover.com", "gem.com",
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -177,6 +179,8 @@ def extract_position(subject):
         r'application\s+for\s+(?:the\s+)?(.+?)\s+(?:at|with|@)\s+',
         # "Your Software Engineer application"
         r'your\s+(.+?)\s+application',
+        # "An update on your application for Senior Product Manager (Amex Digital)"
+        r'(?:update|status)\s+on\s+your\s+application\s+for\s+(?:the\s+)?(.+?)$',
         # "applying to Software Engineer"
         r'applying\s+to\s+(?:the\s+)?(.+?)\s+(?:at|with|@|position|role)',
         # "applied for Software Engineer"
@@ -194,7 +198,12 @@ def extract_position(subject):
         if match:
             position = match.group(1).strip()
             # Clean up common trailing words
-            position = re.sub(r'\s*(?:has been|was|received|submitted|confirmed).*$', '', position, flags=re.IGNORECASE)
+            position = re.sub(r'\s*(?:has been|was|received|submitted|confirmed|is being|under review).*$', '', position, flags=re.IGNORECASE)
+            # Strip trailing job/requisition IDs like "- (26000062)" or "(REQ-12345)"
+            position = re.sub(r'\s*-?\s*\([\w\-]+\)\s*$', '', position)
+            # Strip trailing dash separators and anything after
+            position = re.sub(r'\s*\-\s*$', '', position)
+            position = position.strip(' -')
             # Don't return if it looks like a company name or is too short
             if len(position) > 2 and not re.match(r'^(?:the|a|an|our|your)$', position, re.IGNORECASE):
                 return position.strip()
@@ -210,17 +219,81 @@ def run_gws(args_list):
     cmd = ["gws"] + args_list
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        err_msg = result.stderr.strip() if result.stderr else "unknown error"
+        print(f"\n   [gws error] {' '.join(args_list[:4])}... → {err_msg}", flush=True)
         return None
     try:
         return json.loads(result.stdout)
-    except Exception:
+    except Exception as e:
+        print(f"\n   [gws parse error] Could not parse response: {e}", flush=True)
         return None
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPER: Extract company name from subject line (used for ATS emails)
+# e.g. "Thank you for applying to Kikoff" → "Kikoff"
+# ─────────────────────────────────────────────────────────────
+def _clean_company_from_match(raw):
+    """Post-process a captured company name: strip trailing noise phrases and punctuation."""
+    if not raw:
+        return ""
+    company = raw.strip()
+    # Strip trailing status phrases that lazy regex can accidentally capture
+    company = re.sub(
+        r'\s+(?:has been|was|is|received|submitted|confirmed|next steps|under review|being reviewed|successfully).*$',
+        '', company, flags=re.IGNORECASE
+    )
+    # Strip trailing dash/pipe separators and anything after
+    company = re.sub(r'\s*[\-\|—–]\s+.*$', '', company)
+    company = company.strip(' "\'!.,<>-|—–')
+    return company
+
+
+def extract_company_from_subject(subject):
+    if not subject:
+        return ""
+    patterns = [
+        # ── Company AFTER a keyword (existing patterns, improved) ──
+
+        # "Thank you for applying to Brex!"
+        r'(?:thank(?:s| you) for (?:applying|your application)(?: to| with| at| for)?)\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+        # "Applied to/for/with Stripe"
+        r'(?:applied (?:to|for|with))\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+        # "Your application to/at Stripe"
+        r'(?:your application (?:to|at|with|for))\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+        # "Application to/at/for Stripe"
+        r'(?:application (?:to|at|with|for))\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+        # "Applying to Stripe"
+        r'(?:applying to)\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+        # "Application Update from Tesla"
+        r'(?:application\s+(?:update|status|confirmation)\s+from)\s+([A-Za-z0-9][^!,\.\n]+?)(?:[!,\.]|$)',
+
+        # ── Company BEFORE a keyword (new patterns for ATS emails) ──
+
+        # "Decagon: Application Confirmation" — company before colon + application keyword
+        r'^([A-Za-z0-9][^:\n]+?):\s*(?:application|your application|application status)',
+        # "Comfy Application Update" — company before "Application Update/Status/Confirmation"
+        r'^([A-Za-z0-9][^!\n]+?)\s+(?:application\s+(?:update|status|confirmation|received))',
+        # "Acme Corp — Application Received" / "Acme Corp - Application Status"
+        r'^([A-Za-z0-9][^—–\-\n]+?)\s*[\-—–]\s*(?:application|your application)',
+        # "Acme Corp | Your Application"
+        r'^([A-Za-z0-9][^|\n]+?)\s*\|\s*(?:application|your application)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, subject, re.IGNORECASE)
+        if match:
+            company = _clean_company_from_match(match.group(1))
+            # Skip if it looks like a generic phrase
+            if len(company) > 1 and not re.match(r'^(?:the|a|an|our|your|us|this|re)$', company, re.IGNORECASE):
+                return company
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────
 # HELPER: Figure out company name from the "From" field of an email
+# Falls back to subject-line extraction for ATS senders
 # ─────────────────────────────────────────────────────────────
-def extract_company(from_header):
+def extract_company(from_header, subject=""):
     if not from_header:
         return "Unknown"
 
@@ -240,21 +313,30 @@ def extract_company(from_header):
     domain = domain_match.group(1) if domain_match else ""
     is_ats = any(ats in domain for ats in ATS_DOMAINS)
 
-    # If there's a display name, clean it up and use it
-    if display_name:
+    # If there's a display name and it's not an ATS, clean it up and use it
+    if display_name and not is_ats:
         company = display_name
-        # Remove things like "via Greenhouse", "Recruiting Team", etc.
         company = re.sub(r'\s+via\s+\S+', '', company, flags=re.IGNORECASE)
+        # Only strip qualifier words when they appear as TRAILING suffixes
+        # e.g. "Stripe Careers" → "Stripe", but "Team Rubicon" stays "Team Rubicon"
         company = re.sub(
-            r'\b(recruiting|talent|careers|jobs|hr|noreply|no.reply|team|hiring|notifications?)\b',
+            r'\s+(recruiting|talent|careers|jobs|hr|noreply|no.reply|team|hiring|notifications?)$',
             '', company, flags=re.IGNORECASE
         ).strip()
+        # Strip leading job words (e.g. "Careers Netflix" → "Netflix", "at EliseAI" → "EliseAI")
+        company = re.sub(r'^(careers|recruiting|talent|jobs|hr|at)\s+', '', company, flags=re.IGNORECASE)
+        # Strip standalone noreply-style names entirely
+        if re.match(r'^(noreply|no[\.\-]reply)$', company, re.IGNORECASE):
+            company = ""
         company = company.strip(' "\'<>-|')
         if len(company) > 1:
             return company
 
-    # If it's an ATS domain and no display name, we can't easily tell — mark it
+    # For ATS senders, extract company from subject line
     if is_ats:
+        from_subject = extract_company_from_subject(subject)
+        if from_subject:
+            return from_subject
         return f"Unknown (via {domain})"
 
     # Otherwise use the domain name (e.g. stripe.com → Stripe)
@@ -363,7 +445,7 @@ def get_email_details(msg_id, include_snippet=True):
     position = extract_position(subject)
 
     return {
-        "company": extract_company(from_header),
+        "company": extract_company(from_header, subject),
         "from_email": from_email,
         "subject": subject,
         "date": date_formatted,
@@ -378,35 +460,31 @@ def get_email_details(msg_id, include_snippet=True):
 # ─────────────────────────────────────────────────────────────
 def create_sheet_with_tabs(title):
     """
-    Create a new Google Sheet with two tabs: 'Applications' and 'Monthly Summary'
-    Returns (spreadsheet_id, applications_sheet_id, summary_sheet_id) or None
+    Create a new Google Sheet with four tabs:
+      0 — Dashboard       (charts only, shown first)
+      1 — Applications    (full email list)
+      2 — Monthly Summary (clean stats table)
+      3 — Chart Data      (helper data for charts, hidden from view)
+    Returns (spreadsheet_id, dashboard_id, app_id, summary_id, chart_data_id)
     """
-    # Create spreadsheet with two sheets
     data = run_gws([
         "sheets", "spreadsheets", "create",
         "--json", json.dumps({
             "properties": {"title": title},
             "sheets": [
-                {
-                    "properties": {
-                        "sheetId": 0,
-                        "title": "Applications",
-                        "gridProperties": {"frozenRowCount": 1}
-                    }
-                },
-                {
-                    "properties": {
-                        "sheetId": 1,
-                        "title": "Monthly Summary",
-                        "gridProperties": {"frozenRowCount": 1}
-                    }
-                }
+                {"properties": {"sheetId": 10, "title": "Dashboard", "index": 0}},
+                {"properties": {"sheetId": 20, "title": "Applications",
+                                "gridProperties": {"frozenRowCount": 1}, "index": 1}},
+                {"properties": {"sheetId": 30, "title": "Monthly Summary",
+                                "gridProperties": {"frozenRowCount": 1}, "index": 2}},
+                {"properties": {"sheetId": 40, "title": "Chart Data",
+                                "gridProperties": {"frozenRowCount": 1}, "index": 3}},
             ]
         })
     ])
     if data:
-        return data.get("spreadsheetId"), 0, 1
-    return None, None, None
+        return data.get("spreadsheetId"), 10, 20, 30, 40
+    return None, None, None, None, None
 
 
 def write_to_sheet(spreadsheet_id, range_name, values):
@@ -422,36 +500,105 @@ def write_to_sheet(spreadsheet_id, range_name, values):
     ])
 
 
-def format_sheet(spreadsheet_id, applications_sheet_id, summary_sheet_id, app_row_count):
+def format_sheet(spreadsheet_id, dashboard_sheet_id, applications_sheet_id, summary_sheet_id,
+                 chart_data_sheet_id, app_row_count, month_count):
     """
     Apply formatting to both sheets:
-    - Bold headers
-    - Column widths
-    - Header background color
+    - Dark navy headers with white bold text
+    - Alternating row banding
+    - No gridlines
+    - Clean column widths
+    - Total row bold styling on summary
     """
+    NAVY   = {"red": 0.102, "green": 0.137, "blue": 0.278}
+    WHITE  = {"red": 1.0,   "green": 1.0,   "blue": 1.0}
+    BAND1  = {"red": 1.0,   "green": 1.0,   "blue": 1.0}        # white
+    BAND2  = {"red": 0.937, "green": 0.949, "blue": 0.980}      # very light blue-grey
+    TOTAL  = {"red": 0.878, "green": 0.878, "blue": 0.878}      # light grey for total row
+
     requests = [
-        # ─── Applications tab formatting ───
-        # Bold header row
-        {
-            "repeatCell": {
+        # ══════════════════════════════════════════════════
+        # APPLICATIONS TAB
+        # ══════════════════════════════════════════════════
+
+        # Hide gridlines
+        {"updateSheetProperties": {
+            "properties": {
+                "sheetId": applications_sheet_id,
+                "gridProperties": {"hideGridlines": True}
+            },
+            "fields": "gridProperties.hideGridlines"
+        }},
+
+        # Header row — navy background, white bold text, centered
+        {"repeatCell": {
+            "range": {"sheetId": applications_sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": NAVY,
+                    "textFormat": {"bold": True, "foregroundColor": WHITE, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "padding": {"top": 8, "bottom": 8, "left": 8, "right": 8}
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,padding)"
+        }},
+
+        # Header row height
+        {"updateDimensionProperties": {
+            "range": {"sheetId": applications_sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 36}, "fields": "pixelSize"
+        }},
+
+        # Data rows height
+        {"updateDimensionProperties": {
+            "range": {"sheetId": applications_sheet_id, "dimension": "ROWS", "startIndex": 1, "endIndex": app_row_count + 1},
+            "properties": {"pixelSize": 28}, "fields": "pixelSize"
+        }},
+
+        # Alternating row banding
+        {"addBanding": {
+            "bandedRange": {
                 "range": {
                     "sheetId": applications_sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1
+                    "startRowIndex": 1,
+                    "endRowIndex": app_row_count + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 5
                 },
-                "cell": {
-                    "userEnteredFormat": {
-                        "textFormat": {"bold": True},
-                        "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}
-                    }
-                },
-                "fields": "userEnteredFormat(textFormat,backgroundColor)"
+                "rowProperties": {
+                    "firstBandColor": BAND1,
+                    "secondBandColor": BAND2
+                }
             }
-        },
-        # Column widths for Applications
+        }},
+
+        # Data rows — font size + vertical alignment
+        {"repeatCell": {
+            "range": {"sheetId": applications_sheet_id, "startRowIndex": 1, "endRowIndex": app_row_count + 1},
+            "cell": {
+                "userEnteredFormat": {
+                    "textFormat": {"fontSize": 10},
+                    "verticalAlignment": "MIDDLE",
+                    "padding": {"top": 4, "bottom": 4, "left": 8, "right": 8}
+                }
+            },
+            "fields": "userEnteredFormat(textFormat,verticalAlignment,padding)"
+        }},
+
+        # Date column — center aligned
+        {"repeatCell": {
+            "range": {"sheetId": applications_sheet_id, "startRowIndex": 1, "endRowIndex": app_row_count + 1,
+                      "startColumnIndex": 0, "endColumnIndex": 1},
+            "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }},
+
+        # Column widths — Date, Company, Position, Subject, Sender
         {"updateDimensionProperties": {
             "range": {"sheetId": applications_sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 100}, "fields": "pixelSize"
+            "properties": {"pixelSize": 110}, "fields": "pixelSize"
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": applications_sheet_id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
@@ -459,46 +606,163 @@ def format_sheet(spreadsheet_id, applications_sheet_id, summary_sheet_id, app_ro
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": applications_sheet_id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
-            "properties": {"pixelSize": 200}, "fields": "pixelSize"
+            "properties": {"pixelSize": 220}, "fields": "pixelSize"
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": applications_sheet_id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4},
-            "properties": {"pixelSize": 350}, "fields": "pixelSize"
+            "properties": {"pixelSize": 340}, "fields": "pixelSize"
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": applications_sheet_id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5},
-            "properties": {"pixelSize": 250}, "fields": "pixelSize"
+            "properties": {"pixelSize": 230}, "fields": "pixelSize"
         }},
-        # ─── Monthly Summary tab formatting ───
-        # Bold header row
-        {
-            "repeatCell": {
+
+        # ══════════════════════════════════════════════════
+        # MONTHLY SUMMARY TAB
+        # ══════════════════════════════════════════════════
+
+        # Hide gridlines
+        {"updateSheetProperties": {
+            "properties": {
+                "sheetId": summary_sheet_id,
+                "gridProperties": {"hideGridlines": True}
+            },
+            "fields": "gridProperties.hideGridlines"
+        }},
+
+        # Header row — navy + white bold
+        {"repeatCell": {
+            "range": {"sheetId": summary_sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": NAVY,
+                    "textFormat": {"bold": True, "foregroundColor": WHITE, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "padding": {"top": 8, "bottom": 8, "left": 8, "right": 8}
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,padding)"
+        }},
+
+        # Header row height
+        {"updateDimensionProperties": {
+            "range": {"sheetId": summary_sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 36}, "fields": "pixelSize"
+        }},
+
+        # Data rows height
+        {"updateDimensionProperties": {
+            "range": {"sheetId": summary_sheet_id, "dimension": "ROWS", "startIndex": 1, "endIndex": month_count + 2},
+            "properties": {"pixelSize": 28}, "fields": "pixelSize"
+        }},
+
+        # Alternating row banding (month rows only, not total)
+        {"addBanding": {
+            "bandedRange": {
                 "range": {
                     "sheetId": summary_sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1
+                    "startRowIndex": 1,
+                    "endRowIndex": month_count + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 3
                 },
-                "cell": {
-                    "userEnteredFormat": {
-                        "textFormat": {"bold": True},
-                        "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}
-                    }
-                },
-                "fields": "userEnteredFormat(textFormat,backgroundColor)"
+                "rowProperties": {
+                    "firstBandColor": BAND1,
+                    "secondBandColor": BAND2
+                }
             }
-        },
-        # Column widths for Monthly Summary
+        }},
+
+        # Data rows font + alignment
+        {"repeatCell": {
+            "range": {"sheetId": summary_sheet_id, "startRowIndex": 1, "endRowIndex": month_count + 1},
+            "cell": {
+                "userEnteredFormat": {
+                    "textFormat": {"fontSize": 10},
+                    "verticalAlignment": "MIDDLE",
+                    "horizontalAlignment": "CENTER",
+                    "padding": {"top": 4, "bottom": 4, "left": 8, "right": 8}
+                }
+            },
+            "fields": "userEnteredFormat(textFormat,verticalAlignment,horizontalAlignment,padding)"
+        }},
+
+        # Total row — bold, grey background (scoped to A-C only)
+        {"repeatCell": {
+            "range": {
+                "sheetId": summary_sheet_id,
+                "startRowIndex": month_count + 1,
+                "endRowIndex": month_count + 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 3
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": TOTAL,
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "padding": {"top": 6, "bottom": 6, "left": 8, "right": 8}
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,padding)"
+        }},
+
+        # Column widths — Month, Applications, Unique Companies
         {"updateDimensionProperties": {
             "range": {"sheetId": summary_sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 120}, "fields": "pixelSize"
+            "properties": {"pixelSize": 150}, "fields": "pixelSize"
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": summary_sheet_id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
-            "properties": {"pixelSize": 120}, "fields": "pixelSize"
+            "properties": {"pixelSize": 130}, "fields": "pixelSize"
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": summary_sheet_id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
-            "properties": {"pixelSize": 140}, "fields": "pixelSize"
+            "properties": {"pixelSize": 160}, "fields": "pixelSize"
+        }},
+
+        # ══════════════════════════════════════════════════
+        # DASHBOARD TAB — no gridlines, clean background
+        # ══════════════════════════════════════════════════
+        {"updateSheetProperties": {
+            "properties": {
+                "sheetId": dashboard_sheet_id,
+                "gridProperties": {"hideGridlines": True}
+            },
+            "fields": "gridProperties.hideGridlines"
+        }},
+
+        # ══════════════════════════════════════════════════
+        # CHART DATA TAB — minimal styling, just usable
+        # ══════════════════════════════════════════════════
+        {"repeatCell": {
+            "range": {"sheetId": chart_data_sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": NAVY,
+                    "textFormat": {"bold": True, "foregroundColor": WHITE, "fontSize": 10},
+                    "horizontalAlignment": "CENTER"
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": chart_data_sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 150}, "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": chart_data_sheet_id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
+            "properties": {"pixelSize": 100}, "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": chart_data_sheet_id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4},
+            "properties": {"pixelSize": 160}, "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": chart_data_sheet_id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5},
+            "properties": {"pixelSize": 80}, "fields": "pixelSize"
         }},
     ]
 
@@ -509,197 +773,158 @@ def format_sheet(spreadsheet_id, applications_sheet_id, summary_sheet_id, app_ro
     ])
 
 
-def write_company_counts(spreadsheet_id, applications, start_col="E"):
+def write_chart_data(spreadsheet_id, applications, sorted_months, month_counts):
     """
-    Write top companies by application count to the Monthly Summary tab.
-    This data will be used as the source for the Top Companies chart.
-    Returns the number of companies written (for chart range calculation).
+    Write all chart source data to the 'Chart Data' sheet.
+      A-B: Monthly applications (Month, Count)
+      D-E: Top companies (Company, Count)
+    Returns company_count for chart range calculation.
     """
-    # Count applications per company
+    # Monthly data — columns A-B
+    monthly_header = [["Month", "Applications"]]
+    monthly_rows = [[m, month_counts[m]] for m in sorted_months]
+    write_to_sheet(spreadsheet_id, "Chart Data!A1", monthly_header + monthly_rows)
+
+    # Top companies — columns D-E
     company_counts = defaultdict(int)
     for app in applications:
         company_counts[app["company"]] += 1
-
-    # Sort by count descending, take top 15
     sorted_companies = sorted(company_counts.items(), key=lambda x: -x[1])[:15]
-
     if not sorted_companies:
         return 0
-
-    # Write header and data starting at column E
-    header = [["Top Companies", "Count"]]
-    rows = [[company, count] for company, count in sorted_companies]
-
-    write_to_sheet(spreadsheet_id, f"Monthly Summary!{start_col}1", header + rows)
+    company_header = [["Company", "Count"]]
+    company_rows = [[c, n] for c, n in sorted_companies]
+    write_to_sheet(spreadsheet_id, "Chart Data!D1", company_header + company_rows)
 
     return len(sorted_companies)
 
 
-def create_charts(spreadsheet_id, summary_sheet_id, month_count, company_count):
+def create_charts(spreadsheet_id, dashboard_sheet_id, chart_data_sheet_id, month_count, company_count):
     """
-    Create embedded charts in the Google Sheet:
-    1. Monthly Applications column chart on Monthly Summary tab
-    2. Top Companies horizontal bar chart on Monthly Summary tab
+    Create embedded charts on the Dashboard tab, sourcing data from Chart Data tab.
+    1. Column chart — Applications by Month
+    2. Horizontal bar chart — Top Companies
+    Both placed side-by-side on the clean Dashboard sheet.
     """
+    ANCHOR_ROW = 1   # start near the top of the Dashboard
+    NAVY_COLOR = {"red": 0.102, "green": 0.137, "blue": 0.278}
+    GREEN_COLOR = {"red": 0.133, "green": 0.694, "blue": 0.298}
+
     requests = []
 
-    # ─── Chart 1: Month-over-Month Applications ───────────────
-    # Data is in Monthly Summary!A2:B{month_count+1} (excluding Total row)
+    # ─── Chart 1: Applications by Month (Column chart) ────────
     if month_count > 0:
-        monthly_chart = {
+        requests.append({
             "addChart": {
                 "chart": {
                     "spec": {
                         "title": "Applications by Month",
+                        "titleTextFormat": {"bold": True, "fontSize": 13},
+                        "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
                         "basicChart": {
                             "chartType": "COLUMN",
-                            "legendPosition": "BOTTOM_LEGEND",
+                            "legendPosition": "NO_LEGEND",
                             "axis": [
-                                {
-                                    "position": "BOTTOM_AXIS",
-                                    "title": "Month"
+                                {"position": "BOTTOM_AXIS", "title": ""},
+                                {"position": "LEFT_AXIS", "title": "Applications"}
+                            ],
+                            "domains": [{
+                                "domain": {
+                                    "sourceRange": {"sources": [{
+                                        "sheetId": chart_data_sheet_id,
+                                        "startRowIndex": 1, "endRowIndex": month_count + 1,
+                                        "startColumnIndex": 0, "endColumnIndex": 1
+                                    }]}
+                                }
+                            }],
+                            "series": [{
+                                "series": {
+                                    "sourceRange": {"sources": [{
+                                        "sheetId": chart_data_sheet_id,
+                                        "startRowIndex": 1, "endRowIndex": month_count + 1,
+                                        "startColumnIndex": 1, "endColumnIndex": 2
+                                    }]}
                                 },
-                                {
-                                    "position": "LEFT_AXIS",
-                                    "title": "Applications"
+                                "color": NAVY_COLOR,
+                                "dataLabel": {
+                                    "type": "DATA",
+                                    "textFormat": {"bold": True, "fontSize": 10}
                                 }
-                            ],
-                            "domains": [
-                                {
-                                    "domain": {
-                                        "sourceRange": {
-                                            "sources": [
-                                                {
-                                                    "sheetId": summary_sheet_id,
-                                                    "startRowIndex": 1,
-                                                    "endRowIndex": month_count + 1,
-                                                    "startColumnIndex": 0,
-                                                    "endColumnIndex": 1
-                                                }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ],
-                            "series": [
-                                {
-                                    "series": {
-                                        "sourceRange": {
-                                            "sources": [
-                                                {
-                                                    "sheetId": summary_sheet_id,
-                                                    "startRowIndex": 1,
-                                                    "endRowIndex": month_count + 1,
-                                                    "startColumnIndex": 1,
-                                                    "endColumnIndex": 2
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    "color": {
-                                        "red": 0.26,
-                                        "green": 0.52,
-                                        "blue": 0.96
-                                    }
-                                }
-                            ],
+                            }],
                             "headerCount": 0
                         }
                     },
                     "position": {
                         "overlayPosition": {
                             "anchorCell": {
-                                "sheetId": summary_sheet_id,
-                                "rowIndex": month_count + 3,
+                                "sheetId": dashboard_sheet_id,
+                                "rowIndex": ANCHOR_ROW,
                                 "columnIndex": 0
                             },
-                            "widthPixels": 600,
-                            "heightPixels": 350
+                            "widthPixels": 560,
+                            "heightPixels": 380
                         }
                     }
                 }
             }
-        }
-        requests.append(monthly_chart)
+        })
 
-    # ─── Chart 2: Top Companies by Applications ───────────────
-    # Data is in Monthly Summary!E2:F{company_count+1}
+    # ─── Chart 2: Top Companies (Horizontal Bar chart) ────────
     if company_count > 0:
-        companies_chart = {
+        requests.append({
             "addChart": {
                 "chart": {
                     "spec": {
-                        "title": "Top Companies by Applications",
+                        "title": "Top Companies Applied To",
+                        "titleTextFormat": {"bold": True, "fontSize": 13},
+                        "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
                         "basicChart": {
                             "chartType": "BAR",
                             "legendPosition": "NO_LEGEND",
                             "axis": [
-                                {
-                                    "position": "BOTTOM_AXIS",
-                                    "title": "Applications"
+                                {"position": "BOTTOM_AXIS", "title": "Applications"},
+                                {"position": "LEFT_AXIS",   "title": ""}
+                            ],
+                            "domains": [{
+                                "domain": {
+                                    "sourceRange": {"sources": [{
+                                        "sheetId": chart_data_sheet_id,
+                                        "startRowIndex": 1, "endRowIndex": company_count + 1,
+                                        "startColumnIndex": 3, "endColumnIndex": 4
+                                    }]}
+                                }
+                            }],
+                            "series": [{
+                                "series": {
+                                    "sourceRange": {"sources": [{
+                                        "sheetId": chart_data_sheet_id,
+                                        "startRowIndex": 1, "endRowIndex": company_count + 1,
+                                        "startColumnIndex": 4, "endColumnIndex": 5
+                                    }]}
                                 },
-                                {
-                                    "position": "LEFT_AXIS",
-                                    "title": "Company"
+                                "color": GREEN_COLOR,
+                                "dataLabel": {
+                                    "type": "DATA",
+                                    "textFormat": {"bold": True, "fontSize": 10}
                                 }
-                            ],
-                            "domains": [
-                                {
-                                    "domain": {
-                                        "sourceRange": {
-                                            "sources": [
-                                                {
-                                                    "sheetId": summary_sheet_id,
-                                                    "startRowIndex": 1,
-                                                    "endRowIndex": company_count + 1,
-                                                    "startColumnIndex": 4,
-                                                    "endColumnIndex": 5
-                                                }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ],
-                            "series": [
-                                {
-                                    "series": {
-                                        "sourceRange": {
-                                            "sources": [
-                                                {
-                                                    "sheetId": summary_sheet_id,
-                                                    "startRowIndex": 1,
-                                                    "endRowIndex": company_count + 1,
-                                                    "startColumnIndex": 5,
-                                                    "endColumnIndex": 6
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    "color": {
-                                        "red": 0.18,
-                                        "green": 0.8,
-                                        "blue": 0.44
-                                    }
-                                }
-                            ],
+                            }],
                             "headerCount": 0
                         }
                     },
                     "position": {
                         "overlayPosition": {
                             "anchorCell": {
-                                "sheetId": summary_sheet_id,
-                                "rowIndex": month_count + 3,
-                                "columnIndex": 4
+                                "sheetId": dashboard_sheet_id,
+                                "rowIndex": ANCHOR_ROW,
+                                "columnIndex": 9
                             },
-                            "widthPixels": 500,
-                            "heightPixels": 400
+                            "widthPixels": 560,
+                            "heightPixels": 460
                         }
                     }
                 }
             }
-        }
-        requests.append(companies_chart)
+        })
 
     if requests:
         run_gws([
@@ -720,7 +945,7 @@ def main():
     print()
 
     # Build the Gmail search query
-    query = " OR ".join([f'"{k}"' for k in KEYWORDS])
+    query = "(" + " OR ".join([f'"{k}"' for k in KEYWORDS]) + ") after:2026/03/15"
 
     # ── STEP 1: Find matching emails ──────────────────────────
     print("[ STEP 1 ] Searching Gmail for application confirmation emails...")
@@ -783,11 +1008,14 @@ def main():
         [m for m in month_counts if m != "Unknown"],
         key=month_sort_key
     )
+    # Include "Unknown" at the end if any emails had unparseable dates
+    if "Unknown" in month_counts:
+        sorted_months.append("Unknown")
 
-    # ── STEP 4: Create Google Sheet with two tabs ─────────────
+    # ── STEP 4: Create Google Sheet with four tabs ────────────
     print("[ STEP 4 ] Creating your Google Sheet...")
     today_str = datetime.now().strftime("%b %d, %Y")
-    sheet_id, app_sheet_id, summary_sheet_id = create_sheet_with_tabs(
+    sheet_id, dash_sheet_id, app_sheet_id, summary_sheet_id, chart_data_sheet_id = create_sheet_with_tabs(
         f"Job Applications Tracker ({today_str})"
     )
 
@@ -813,19 +1041,19 @@ def main():
     ]
     total_unique = len(set(a["company"] for a in applications))
     summary_rows.append(["Total", len(applications), total_unique])
-
     write_to_sheet(sheet_id, "Monthly Summary!A1", summary_headers + summary_rows)
 
-    # ── Write: Top companies data for chart ───────────────────
-    company_count = write_company_counts(sheet_id, applications)
+    # ── Write: Chart Data tab (source for Dashboard charts) ───
+    company_count = write_chart_data(sheet_id, applications, sorted_months, month_counts)
 
     # ── Apply formatting ──────────────────────────────────────
     print("   Applying formatting...")
-    format_sheet(sheet_id, app_sheet_id, summary_sheet_id, len(applications))
+    format_sheet(sheet_id, dash_sheet_id, app_sheet_id, summary_sheet_id,
+                 chart_data_sheet_id, len(applications), len(sorted_months))
 
-    # ── Create charts ─────────────────────────────────────────
+    # ── Create charts on Dashboard ────────────────────────────
     print("   Creating charts...")
-    create_charts(sheet_id, summary_sheet_id, len(sorted_months), company_count)
+    create_charts(sheet_id, dash_sheet_id, chart_data_sheet_id, len(sorted_months), company_count)
 
     # ── Print final results ───────────────────────────────────
     print()
