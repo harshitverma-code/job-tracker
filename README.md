@@ -2,6 +2,10 @@
 
 Automatically scans your Gmail inbox for job application confirmation emails and creates a beautiful Google Sheet with all your applications organized and visualized.
 
+## Demo
+
+https://github.com/harshitverma-code/job-tracker/releases/download/v1.0/demo.mov
+
 ## What You'll Get
 
 A Google Sheet with:
@@ -178,7 +182,7 @@ cd ~/Desktop/job-tracker
 python3 job_tracker.py
 ```
 
-This creates a new Google Sheet each time with all your applications.
+The script updates the same Google Sheet each time — no duplicate files.
 
 ---
 
