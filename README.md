@@ -4,7 +4,7 @@ Automatically scans your Gmail inbox for job application confirmation emails and
 
 ## Demo
 
-https://github.com/harshitverma-code/job-tracker/releases/download/v1.0/demo.mov
+https://github.com/harshitverma-code/job-tracker/raw/main/demo.mp4
 
 ## What You'll Get
 
